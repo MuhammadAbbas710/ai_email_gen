@@ -59,6 +59,16 @@ To pin a specific model, add this to your secrets:
 GEMINI_MODEL = "gemini-2.5-flash"
 ```
 
+### Automatic retries and fallback
+
+Gemini sometimes answers with a temporary error (503 "overloaded", 500, 429). The app handles this itself:
+it retries up to 4 times with increasing waits, then switches to a lighter fallback model
+(`gemini-flash-lite-latest` by default). To change or disable the fallback:
+
+```toml
+GEMINI_FALLBACK_MODEL = "gemini-2.5-flash-lite"   # or "none" to disable
+```
+
 Check [Google's model list](https://ai.google.dev/gemini-api/docs/models) for the names available to you.
 
 ## Upload to GitHub
@@ -98,9 +108,10 @@ Check [Google's model list](https://ai.google.dev/gemini-api/docs/models) for th
 | "No Gemini API key found" | Add `GEMINI_API_KEY` to `.streamlit/secrets.toml` (local) or the app's Secrets (cloud). |
 | "API rejected the request" | The key is invalid or the model name is wrong. Re-copy the key; remove `GEMINI_MODEL` to use the default. |
 | "Model ... was not found" | Set `GEMINI_MODEL` to a model name listed in Google's docs. |
+| "Gemini servers are overloaded (503)" | Temporary on Google's side. The app already retried and tried the fallback model; wait a minute and click Generate again. |
 | "Rate limit or quota reached" | Wait a minute and retry, or check your quota in Google AI Studio. |
 | Build fails on Streamlit Cloud | Make sure `requirements.txt` is in the repo root and `app.py` is selected as the main file. |
 
 ## Privacy note
 
-The text you enter is sent to Google's Gemini API to generate the email. Don't enter passwords or highly sensitive data.# ai_email_gen
+The text you enter is sent to Google's Gemini API to generate the email. Don't enter passwords or highly sensitive data.
