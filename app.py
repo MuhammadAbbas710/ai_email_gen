@@ -5,10 +5,19 @@ The app asks a Gemini Flash model to draft a ready-to-send professional email.
 """
 
 import os
+import time
 
 import streamlit as st
 from google import genai
 from google.genai import errors, types
+
+# Temporary server-side problems (overloaded / unavailable) are retried.
+RETRYABLE_CODES = {429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 4          # tries per model
+BACKOFF_SECONDS = 1.5     # wait grows: 1.5s, 3s, 6s
+# Used automatically if the main model stays overloaded. Override with the
+# GEMINI_FALLBACK_MODEL secret, or set it to "none" to disable the fallback.
+DEFAULT_FALLBACK_MODEL = "gemini-flash-lite-latest"
 
 # "gemini-flash-latest" is an alias that Google keeps pointing at the newest
 # Flash model. Override it with a GEMINI_MODEL secret / environment variable
@@ -100,36 +109,75 @@ def build_prompt(purpose, recipient, tone, length, sender):
     return "\n".join(lines)
 
 
-def generate_email(client, model, prompt):
+def _call_model(client, model, prompt):
+    """Single request to Gemini. May raise errors.APIError."""
+    return client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_INSTRUCTION,
+            temperature=0.7,
+        ),
+    )
+
+
+def _call_with_retries(client, model, prompt):
+    """Call one model, retrying temporary errors (503 etc.) with backoff."""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return _call_model(client, model, prompt)
+        except errors.APIError as exc:
+            code = getattr(exc, "code", None)
+            if code in RETRYABLE_CODES and attempt < MAX_ATTEMPTS:
+                time.sleep(BACKOFF_SECONDS * (2 ** (attempt - 1)))
+                continue
+            raise
+
+
+def generate_email(client, model, prompt, fallback_model=None):
     """Call Gemini and return the email text. Raises RuntimeError with a
     user-friendly message on failure."""
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                temperature=0.7,
-            ),
-        )
-    except errors.APIError as exc:
-        code = getattr(exc, "code", None)
+    models_to_try = [model]
+    if fallback_model and fallback_model.lower() != "none" and fallback_model != model:
+        models_to_try.append(fallback_model)
+
+    response = None
+    last_exc = None
+    for current in models_to_try:
+        try:
+            response = _call_with_retries(client, current, prompt)
+            break
+        except errors.APIError as exc:
+            last_exc = exc
+            code = getattr(exc, "code", None)
+            # Overloaded/unavailable or model missing -> try the fallback model.
+            if code in RETRYABLE_CODES or code == 404:
+                continue
+            break
+        except Exception as exc:  # network problems, timeouts, etc.
+            raise RuntimeError(f"Could not reach the Gemini API: {exc}") from exc
+
+    if response is None:
+        code = getattr(last_exc, "code", None)
         if code in (400, 401, 403):
             raise RuntimeError(
                 "The Gemini API rejected the request. Check that your API key is valid "
                 "and that the model name is correct."
-            ) from exc
+            ) from last_exc
         if code == 404:
             raise RuntimeError(
                 f"Model '{model}' was not found. Set GEMINI_MODEL to a valid model name."
-            ) from exc
+            ) from last_exc
         if code == 429:
             raise RuntimeError(
-                "Rate limit or quota reached. Please wait a moment and try again."
-            ) from exc
-        raise RuntimeError(f"The Gemini API returned an error (code {code}). Please try again.") from exc
-    except Exception as exc:  # network problems, timeouts, etc.
-        raise RuntimeError(f"Could not reach the Gemini API: {exc}") from exc
+                "Rate limit or quota reached. Please wait a minute and try again."
+            ) from last_exc
+        if code in (500, 502, 503, 504):
+            raise RuntimeError(
+                "Google's Gemini servers are overloaded right now (error "
+                f"{code}). The app already retried several times. Please try again in a minute."
+            ) from last_exc
+        raise RuntimeError(f"The Gemini API returned an error (code {code}). Please try again.") from last_exc
 
     text = (getattr(response, "text", None) or "").strip()
     if not text:
@@ -147,6 +195,7 @@ def main():
 
     api_key = get_setting("GEMINI_API_KEY") or get_setting("GOOGLE_API_KEY")
     model = get_setting("GEMINI_MODEL", DEFAULT_MODEL)
+    fallback_model = get_setting("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK_MODEL)
 
     if not api_key:
         st.error(
@@ -193,7 +242,7 @@ def main():
             try:
                 with st.spinner("Writing your email..."):
                     client = get_client(api_key)
-                    st.session_state["email"] = generate_email(client, model, prompt)
+                    st.session_state["email"] = generate_email(client, model, prompt, fallback_model)
             except RuntimeError as exc:
                 st.session_state.pop("email", None)
                 st.error(str(exc))
